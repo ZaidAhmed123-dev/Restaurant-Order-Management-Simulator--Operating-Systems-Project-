@@ -428,15 +428,12 @@ static void read_order_details(Order *order, int id, int runtime_order) {
     read_line("Priority (VIP/NORMAL): ", line, sizeof(line));
     order->priority = parse_priority(line);
     order->prep_time = read_int("Prep Time (seconds): ");
-    order->arrival_time = runtime_order ? 0 : read_int("Arrival Time (seconds from simulation start): ");
 
-    if (order->arrival_time < 0) {
-        order->arrival_time = 0;
-    }
     if (order->prep_time < 1) {
         order->prep_time = 1;
     }
 
+    /* arrival_time will be set by caller: initial batches get auto-assigned, runtime orders are immediate */
     order->remaining_prep_time = order->prep_time;
     order->enqueue_time = 0;
     order->first_enqueue_time = 0;
@@ -458,9 +455,12 @@ static void prompt_for_initial_orders(void) {
     }
 
     pthread_mutex_lock(&pending_lock);
+    int next_arrival = 0;
     for (int i = 0; i < count; i++) {
         printf("\n--- Order #%d ---\n", total_orders + 1);
         read_order_details(&pending_orders[total_orders], total_orders + 1, 0);
+        /* auto-assign arrival times spaced by 1 second to avoid asking the user */
+        pending_orders[total_orders].arrival_time = next_arrival++;
         total_orders++;
     }
     pthread_mutex_unlock(&pending_lock);
@@ -1004,7 +1004,63 @@ int main(void) {
 
     pthread_create(&status_thread, NULL, status_monitor, NULL);
 
-    run_control_loop();
+    /* Main cycle: wait for current batch to finish, then show menu once to add more or exit */
+    while (running) {
+        /* Wait for current workload to drain */
+        while (running && (pending_remaining() > 0 || all_queue_sizes() > 0 || active_chefs > 0)) {
+            sleep(1);
+        }
+
+        if (!running) break;
+
+        /* Show menu once after batch finishes; allow multiple interactions until user chooses to start a new batch or exit */
+        int exit_requested = 0;
+        while (running && !exit_requested) {
+            print_control_menu();
+            int choice = read_int("Select option: ");
+            switch (choice) {
+                case 1: {
+                    int add_count = read_int("How many new orders to add now? ");
+                    if (add_count <= 0) {
+                        printf(COLOR_YELLOW "No orders added.\n" COLOR_RESET);
+                        break;
+                    }
+                    for (int k = 0; k < add_count; k++) {
+                        add_order_to_system(1);
+                    }
+                    /* break out to let system process new orders */
+                    exit_requested = 1;
+                    break;
+                }
+                case 2:
+                    view_queue();
+                    break;
+                case 3:
+                    print_status();
+                    break;
+                case 4:
+                    pause_kitchen();
+                    break;
+                case 5:
+                    resume_kitchen();
+                    break;
+                case 6:
+                    printf(COLOR_YELLOW "Exiting by user request. Shutting down after draining queues...\n" COLOR_RESET);
+                    orders_closed = 1;
+                    running = 0;
+                    wake_all_threads();
+                    exit_requested = 1;
+                    break;
+                default:
+                    printf(COLOR_RED "[ERROR] Invalid option.\n" COLOR_RESET);
+                    break;
+            }
+        }
+
+        if (!running) break;
+
+        /* loop will wait for newly added orders to finish, or will exit if user chose to quit */
+    }
 
     orders_closed = 1;
     pthread_cond_broadcast(&pending_available);
